@@ -4,10 +4,35 @@ pragma solidity 0.8.26;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "./AgentNFT.sol";
+import "./TBAgentNFT.sol";
 
-contract AgentRegistry is Ownable {
+//interface IERC6551Account {
+//    receive() external payable;
+//    function token() external view returns (uint256 chainId, address tokenContract, uint256 tokenId);
+//    function executeCall(address to, uint256 value, bytes calldata data) external payable returns (bytes memory);
+//}
+
+interface ITBAgentNFT {
+    function createAgent(address to, uint256 agentId, uint8 agentType, string calldata name, string calldata symbol, string calldata customURI) external returns (uint256);
+    function createOwnershipToken(address to, uint256 agentId, uint8 agentType, string memory name, string memory symbol, string memory customURI) external returns (uint256);
+    function getAgentOwnershipToken(uint256 agentId) external view returns (uint256);
+    function getTokenBoundAccount(uint256 tokenId) external view returns (address);
+    function recordUsage(uint256 agentId, address user) external;
+    function distributeRevenue(uint256 agentId, uint256 amount) external;
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function transferFrom(address from, address to, uint256 tokenId) external;
+}
+
+//abstract contract TBAgentNFT {
+//    function getAgentOwnershipToken(uint256 agentId) external virtual view returns (uint256);
+//    function approvedRegistry() external virtual view returns (address);
+//    function getTokenBoundAccount(uint256 ownershipTokenId) external virtual view returns (address);
+//    function ownerOf(uint256 tokenId) external virtual view returns (address);
+//}
+
+contract TBAgentRegistry is Ownable {
     using Counters for Counters.Counter;
+    address public registry;
     
     // Constants
     uint256 public creationFee = 25000 * 10**18; // 25,000 NEOX
@@ -28,7 +53,7 @@ contract AgentRegistry is Ownable {
     
     // Contracts
     IERC20 public neoxToken;
-    AgentNFT public agentNFT;
+    TBAgentNFT public agentNFT;
     
     // Agent struct
     struct Agent {
@@ -53,10 +78,11 @@ contract AgentRegistry is Ownable {
     event AgentCreated(uint256 indexed agentId, address indexed creator, uint8 agentType, string name, string customURI);
     event AgentUsed(uint256 indexed agentId, address indexed user, uint8 tier);
     event TierPurchased(uint256 indexed agentId, address indexed user, uint8 tier);
+    event AgentOwnershipTransferred(uint256 indexed agentId, address indexed previousOwner, address indexed newOwner, uint256 ownershipTokenId);
     
     constructor(address _neoxToken, address _agentNFT) Ownable(msg.sender) {
         neoxToken = IERC20(_neoxToken);
-        agentNFT = AgentNFT(_agentNFT);
+        agentNFT = TBAgentNFT(_agentNFT);
     }
     
     /**
@@ -81,14 +107,14 @@ contract AgentRegistry is Ownable {
         require(bytes(symbol).length >= 2 && bytes(symbol).length <= 6, "Invalid symbol length");
         require(agentType <= 2, "Invalid agent type");
         require(bytes(customURI).length > 0, "Custom URI cannot be empty");
-        
+    
         // Collect creation fee
         neoxToken.transferFrom(msg.sender, address(this), creationFee);
-        
+    
         // Generate agent ID
         uint256 agentId = _agentIdCounter.current();
         _agentIdCounter.increment();
-        
+    
         // Store agent data
         agents[agentId] = Agent({
             name: name,
@@ -102,22 +128,121 @@ contract AgentRegistry is Ownable {
             active: true,
             customURI: customURI
         });
-        
+    
         // Track creator's agents
         creatorAgents[msg.sender].push(agentId);
-        
-        // Mint exactly 12 NFTs to creator
+    
+        // Mint exactly 12 NFTs to creator (regular revenue-sharing NFTs)
         for (uint8 i = 0; i < NFT_COUNT; i++) {
-            agentNFT.createAgent(msg.sender, agentId, agentType, name, symbol, customURI);
+            address tokenAddress = agentNFT.getTokenBoundAccount(agentNFT.getAgentOwnershipToken(agentId));
         }
-        
+    
+        // Mint special ERC6551 ownership NFT to creator
+        uint256 ownershipTokenId = agentNFT.createOwnershipToken(
+            msg.sender,
+            agentId,
+            agentType,
+            name,
+            symbol,
+            customURI
+        );
+    
         // Auto-grant the creator premium tier access
         userTiers[msg.sender][agentId] = TIER_PREMIUM;
-        
+    
         emit AgentCreated(agentId, msg.sender, agentType, name, customURI);
-        
+    
         return agentId;
     }
+    
+    /**
+     * @dev Transfer ownership of an agent to a new address
+     * @param agentId Agent ID
+     * @param newOwner Address of the new owner
+     */
+    function transferAgentOwnership(uint256 agentId, address newOwner) external {
+        require(agents[agentId].active, "Agent not active");
+        require(newOwner != address(0), "Invalid address");
+        
+        // Get the ownership token ID
+        uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
+        require(ownershipTokenId > 0, "No ownership token");
+        
+        // Check that the sender is the current owner of the ownership token
+        require(agentNFT.ownerOf(ownershipTokenId) == msg.sender, "Not the owner");
+        
+        // Transfer the ownership token to the new owner
+        agentNFT.transferFrom(msg.sender, newOwner, ownershipTokenId);
+        
+        // Update the agent creator
+        address previousOwner = agents[agentId].creator;
+        agents[agentId].creator = newOwner;
+        
+        // Update creator's agents list (remove from old owner)
+        uint256[] storage creatorAgentsList = creatorAgents[previousOwner];
+        for (uint256 i = 0; i < creatorAgentsList.length; i++) {
+            if (creatorAgentsList[i] == agentId) {
+                creatorAgentsList[i] = creatorAgentsList[creatorAgentsList.length - 1];
+                creatorAgentsList.pop();
+                break;
+            }
+        }
+        
+        // Add to new owner's agents list
+        creatorAgents[newOwner].push(agentId);
+        
+        // Grant premium tier access to the new owner
+        userTiers[newOwner][agentId] = TIER_PREMIUM;
+        
+        emit AgentOwnershipTransferred(agentId, previousOwner, newOwner, ownershipTokenId);
+    }
+    
+    /**
+     * @dev Get the token bound account address for an agent
+     * @param agentId Agent ID
+     * @return The address of the token bound account
+     */
+    function getAgentTokenBoundAccount(uint256 agentId) external view returns (address) {
+        uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
+        require(ownershipTokenId > 0, "No ownership token");
+        return agentNFT.getTokenBoundAccount(ownershipTokenId);
+    }
+    
+    /**
+     * @dev Execute a call from the agent's token bound account
+     * @param agentId Agent ID
+     * @param to Target address
+     * @param value ETH value
+     * @param data Call data
+     * @return Result of the call
+     */
+    function executeFromAgent(
+        uint256 agentId,
+        address to,
+        uint256 value,
+        bytes calldata data,
+        address nftContract // Pass the nftContract address as a parameter
+    ) external returns (bytes memory) {
+        // Fetch the ownership token ID from the agentNFT contract
+        uint256 ownershipTokenId = TBAgentNFT(nftContract).getAgentOwnershipToken(agentId);
+        require(ownershipTokenId > 0, "No ownership token");
+
+        // Access the approved registry from the nftContract (TBAgentNFT)
+        TBAgentNFT agentNFT = TBAgentNFT(nftContract);
+        address approvedRegistry = agentNFT.approvedRegistry();
+
+        // Ensure that msg.sender is either the owner of the contract or the approved registry
+        require(
+            msg.sender == owner() || msg.sender == approvedRegistry, "Not token owner"
+        );
+
+        // Get the account associated with the ownership token
+        address payable account = payable(agentNFT.getTokenBoundAccount(ownershipTokenId));
+    
+        // Execute the call to the specified address
+        return IERC6551Account(account).executeCall(to, value, data);
+    }
+
     
     /**
      * @dev Purchase tier access to an agent
@@ -178,71 +303,20 @@ contract AgentRegistry is Ownable {
     }
     
     /**
-     * @dev Get complete agent details including configuration
+     * @dev Get the ownership token ID for an agent
      * @param agentId Agent ID
+     * @return tokenId Ownership NFT token ID
      */
-    function getAgentDetails(uint256 agentId) external view returns (
-        string memory name,
-        string memory symbol,
-        uint8 agentType,
-        address creator,
-        uint256 createdAt,
-        uint256 usageCount,
-        bool active,
-        string memory customURI,
-        string memory personality,
-        string memory modelConfig
-    ) {
-        Agent storage agent = agents[agentId];
-        require(agent.createdAt > 0, "Agent does not exist");
-        
-        return (
-            agent.name,
-            agent.symbol,
-            agent.agentType,
-            agent.creator,
-            agent.createdAt,
-            agent.usageCount,
-            agent.active,
-            agent.customURI,
-            agent.personality,
-            agent.modelConfig
-        );
+    function getAgentOwnershipToken(uint256 agentId) external view returns (uint256) {
+        return agentNFT.getAgentOwnershipToken(agentId);
     }
     
     /**
-     * @dev Get all agents created by an address
-     * @param creator Creator address
+     * @dev Get complete agent details including owner data
+     * @param agentId Agent ID
+     * @return agent Agent data structure
      */
-    function getCreatorAgents(address creator) external view returns (uint256[] memory) {
-        return creatorAgents[creator];
-    }
-    
-    /**
-     * @dev Set fees (owner only)
-     * @param _creationFee New creation fee
-     * @param _usageFee New usage fee
-     */
-    function setFees(uint256 _creationFee, uint256 _usageFee) external onlyOwner {
-        creationFee = _creationFee;
-        usageFee = _usageFee;
-    }
-    
-    /**
-     * @dev Set fee distribution (owner only)
-     * @param _creatorPercentage Percentage to creator (0-100)
-     */
-    function setFeeDistribution(uint256 _creatorPercentage) external onlyOwner {
-        require(_creatorPercentage <= 100, "Invalid percentage");
-        creatorPercentage = _creatorPercentage;
-        platformPercentage = 100 - _creatorPercentage;
-    }
-    
-    /**
-     * @dev Withdraw platform fees (owner only)
-     */
-    function withdrawFees() external onlyOwner {
-        uint256 balance = neoxToken.balanceOf(address(this));
-        neoxToken.transfer(owner(), balance);
+    function getAgent(uint256 agentId) external view returns (Agent memory) {
+        return agents[agentId];
     }
 }
