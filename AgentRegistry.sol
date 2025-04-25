@@ -6,12 +6,6 @@ import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./TBAgentNFT.sol";
 
-//interface IERC6551Account {
-//    receive() external payable;
-//    function token() external view returns (uint256 chainId, address tokenContract, uint256 tokenId);
-//    function executeCall(address to, uint256 value, bytes calldata data) external payable returns (bytes memory);
-//}
-
 interface ITBAgentNFT {
     function createAgent(address to, uint256 agentId, uint8 agentType, string calldata name, string calldata symbol, string calldata customURI) external returns (uint256);
     function createOwnershipToken(address to, uint256 agentId, uint8 agentType, string memory name, string memory symbol, string memory customURI) external returns (uint256);
@@ -21,14 +15,8 @@ interface ITBAgentNFT {
     function distributeRevenue(uint256 agentId, uint256 amount) external;
     function ownerOf(uint256 tokenId) external view returns (address);
     function transferFrom(address from, address to, uint256 tokenId) external;
+    function approvedRegistry() external view returns (address);
 }
-
-//abstract contract TBAgentNFT {
-//    function getAgentOwnershipToken(uint256 agentId) external virtual view returns (uint256);
-//    function approvedRegistry() external virtual view returns (address);
-//    function getTokenBoundAccount(uint256 ownershipTokenId) external virtual view returns (address);
-//    function ownerOf(uint256 tokenId) external virtual view returns (address);
-//}
 
 contract TBAgentRegistry is Ownable {
     using Counters for Counters.Counter;
@@ -107,14 +95,14 @@ contract TBAgentRegistry is Ownable {
         require(bytes(symbol).length >= 2 && bytes(symbol).length <= 6, "Invalid symbol length");
         require(agentType <= 2, "Invalid agent type");
         require(bytes(customURI).length > 0, "Custom URI cannot be empty");
-    
+
         // Collect creation fee
         neoxToken.transferFrom(msg.sender, address(this), creationFee);
-    
+
         // Generate agent ID
         uint256 agentId = _agentIdCounter.current();
         _agentIdCounter.increment();
-    
+
         // Store agent data
         agents[agentId] = Agent({
             name: name,
@@ -128,16 +116,11 @@ contract TBAgentRegistry is Ownable {
             active: true,
             customURI: customURI
         });
-    
+
         // Track creator's agents
         creatorAgents[msg.sender].push(agentId);
-    
-        // Mint exactly 12 NFTs to creator (regular revenue-sharing NFTs)
-        for (uint8 i = 0; i < NFT_COUNT; i++) {
-            address tokenAddress = agentNFT.getTokenBoundAccount(agentNFT.getAgentOwnershipToken(agentId));
-        }
-    
-        // Mint special ERC6551 ownership NFT to creator
+
+        // Mint special ERC6551 ownership NFT to creator first
         uint256 ownershipTokenId = agentNFT.createOwnershipToken(
             msg.sender,
             agentId,
@@ -146,12 +129,24 @@ contract TBAgentRegistry is Ownable {
             symbol,
             customURI
         );
-    
+
+        // Mint exactly 12 NFTs to creator (regular revenue-sharing NFTs)
+        for (uint8 i = 0; i < NFT_COUNT; i++) {
+            agentNFT.createAgent(
+                msg.sender,
+                agentId,
+                agentType,
+                name,
+                symbol,
+                customURI
+            );
+        }
+
         // Auto-grant the creator premium tier access
         userTiers[msg.sender][agentId] = TIER_PREMIUM;
-    
+
         emit AgentCreated(agentId, msg.sender, agentType, name, customURI);
-    
+
         return agentId;
     }
     
@@ -214,6 +209,7 @@ contract TBAgentRegistry is Ownable {
      * @param to Target address
      * @param value ETH value
      * @param data Call data
+     * @param nftContract The nftContract address as a parameter
      * @return Result of the call
      */
     function executeFromAgent(
@@ -221,7 +217,7 @@ contract TBAgentRegistry is Ownable {
         address to,
         uint256 value,
         bytes calldata data,
-        address nftContract // Pass the nftContract address as a parameter
+        address nftContract
     ) external returns (bytes memory) {
         // Fetch the ownership token ID from the agentNFT contract
         uint256 ownershipTokenId = TBAgentNFT(nftContract).getAgentOwnershipToken(agentId);
@@ -243,7 +239,6 @@ contract TBAgentRegistry is Ownable {
         return IERC6551Account(account).executeCall(to, value, data);
     }
 
-    
     /**
      * @dev Purchase tier access to an agent
      * @param agentId Agent ID
@@ -318,5 +313,26 @@ contract TBAgentRegistry is Ownable {
      */
     function getAgent(uint256 agentId) external view returns (Agent memory) {
         return agents[agentId];
+    }
+    
+    /**
+     * @dev Get the current agent ID counter value
+     * @return Current agent ID counter value
+     */
+    function getCurrentAgentId() external view returns (uint256) {
+        return _agentIdCounter.current();
+    }
+    
+    /**
+     * @dev Get the ownership token wallet address for an agent
+     * @param agentId Agent ID
+     * @return The address of the ownership token wallet
+     */
+    function getOwnershipTokenWalletAddress(uint256 agentId) external view returns (address) {
+        uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
+        require(ownershipTokenId > 0, "No ownership token found for agent");
+        address walletAddress = agentNFT.getTokenBoundAccount(ownershipTokenId);
+        require(walletAddress != address(0), "Invalid wallet address");
+        return walletAddress;
     }
 }
