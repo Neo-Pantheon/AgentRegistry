@@ -4,6 +4,8 @@ pragma solidity 0.8.26;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 
 interface IERC6551Account {
     receive() external payable;
@@ -16,15 +18,15 @@ interface ITBAgentNFT {
     function createOwnershipToken(address to, uint256 agentId, uint8 agentType, string memory name, string memory symbol, string memory customURI) external returns (uint256);
     function getAgentOwnershipToken(uint256 agentId) external view returns (uint256);
     function getTokenBoundAccount(uint256 tokenId) external view returns (address);
-    function recordUsage(uint256 agentId, address user) external;
-    function distributeRevenue(uint256 agentId, uint256 amount) external;
+    function recordUsage(uint256 agentId, address user) external returns (bool);
+    function distributeRevenue(uint256 agentId, uint256 amount) external returns (bool);
     function ownerOf(uint256 tokenId) external view returns (address);
     function transferFrom(address from, address to, uint256 tokenId) external;
     function approvedRegistry() external view returns (address);
     function symbolOfToken(uint256 tokenId) external view returns (string memory);
 }
 
-contract TBAgentRegistry is Ownable {
+contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     using Counters for Counters.Counter;
     address public registry;
     
@@ -48,6 +50,9 @@ contract TBAgentRegistry is Ownable {
     // Contracts
     IERC20 public neoxToken;
     ITBAgentNFT public agentNFT;
+    
+    // Withdrawal pattern
+    mapping(address => uint256) public pendingWithdrawals;
     
     // Agent struct
     struct Agent {
@@ -81,11 +86,45 @@ contract TBAgentRegistry is Ownable {
     event GlobalOperatorSet(address indexed operator, bool approved);
     event NEOXTransferred(uint256 indexed agentId, address indexed recipient, uint256 amount);
     event NFTTransferred(uint256 indexed agentId, address indexed nftContract, address indexed recipient, uint256 tokenId);
+    event WithdrawalRequested(address indexed recipient, uint256 amount);
+    event WithdrawalCompleted(address indexed recipient, uint256 amount);
+    event RevenueDistributionFailed(uint256 indexed agentId, uint256 amount);
+    event EmergencyWithdraw(address indexed recipient, uint256 amount);
     
     constructor(address _neoxToken, address _agentNFT) Ownable(msg.sender) {
+        require(_neoxToken != address(0), "Zero address for NEOX token");
+        require(_agentNFT != address(0), "Zero address for agent NFT");
+        
         neoxToken = IERC20(_neoxToken);
         agentNFT = ITBAgentNFT(_agentNFT);
     }
+    
+    // ========================
+    // Emergency Controls
+    // ========================
+    
+    function pause() external onlyOwner {
+        _pause();
+    }
+    
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+    
+    function emergencyWithdraw(address recipient) external onlyOwner {
+        require(recipient != address(0), "Zero address recipient");
+        uint256 balance = neoxToken.balanceOf(address(this));
+        require(balance > 0, "No tokens to withdraw");
+        
+        bool success = neoxToken.transfer(recipient, balance);
+        require(success, "Token transfer failed");
+        
+        emit EmergencyWithdraw(recipient, balance);
+    }
+    
+    // ========================
+    // Main Functions
+    // ========================
     
     // Create The AI Agent 12 NFTs & Ownership NFT Token (agentType is 0 = Builder, 1 = Researcher, 2 = Socialite)
     function createAgent(
@@ -95,14 +134,14 @@ contract TBAgentRegistry is Ownable {
         string memory personality,
         string memory modelConfig,
         string memory customURI
-    ) external returns (uint256) {
+    ) external nonReentrant whenNotPaused returns (uint256) {
         require(bytes(name).length >= 3, "Name too short");
         require(bytes(symbol).length >= 2 && bytes(symbol).length <= 6, "Invalid symbol length");
         require(agentType <= 2, "Invalid agent type");
         require(bytes(customURI).length > 0, "Custom URI cannot be empty");
 
-        // Collect creation fee
-        neoxToken.transferFrom(msg.sender, address(this), creationFee);
+        // Collect creation fee with proper checks
+        require(neoxToken.transferFrom(msg.sender, address(this), creationFee), "Fee collection failed");
 
         // Generate agent ID
         uint256 agentId = _agentIdCounter.current();
@@ -156,7 +195,7 @@ contract TBAgentRegistry is Ownable {
     }
     
     // Transfer Agent Ownership
-    function transferAgentOwnership(uint256 agentId, address newOwner) external {
+    function transferAgentOwnership(uint256 agentId, address newOwner) external nonReentrant whenNotPaused {
         require(agents[agentId].active, "Agent not active");
         require(newOwner != address(0), "Invalid address");
         
@@ -175,14 +214,7 @@ contract TBAgentRegistry is Ownable {
         agents[agentId].creator = newOwner;
         
         // Update creator's agents list (remove from old owner)
-        uint256[] storage creatorAgentsList = creatorAgents[previousOwner];
-        for (uint256 i = 0; i < creatorAgentsList.length; i++) {
-            if (creatorAgentsList[i] == agentId) {
-                creatorAgentsList[i] = creatorAgentsList[creatorAgentsList.length - 1];
-                creatorAgentsList.pop();
-                break;
-            }
-        }
+        _removeAgentFromCreator(previousOwner, agentId);
         
         // Add to new owner's agents list
         creatorAgents[newOwner].push(agentId);
@@ -193,6 +225,21 @@ contract TBAgentRegistry is Ownable {
         emit AgentOwnershipTransferred(agentId, previousOwner, newOwner, ownershipTokenId);
     }
     
+    // Helper function to remove agent from creator's list
+    function _removeAgentFromCreator(address creator, uint256 agentId) internal {
+        uint256[] storage creatorAgentsList = creatorAgents[creator];
+        for (uint256 i = 0; i < creatorAgentsList.length; i++) {
+            if (creatorAgentsList[i] == agentId) {
+                // Swap and pop to avoid gaps in array (gas efficient)
+                if (i < creatorAgentsList.length - 1) {
+                    creatorAgentsList[i] = creatorAgentsList[creatorAgentsList.length - 1];
+                }
+                creatorAgentsList.pop();
+                break;
+            }
+        }
+    }
+    
     // Get Ownership NFT wallet address
     function getAgentTokenBoundAccount(uint256 agentId) external view returns (address) {
         uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
@@ -200,8 +247,13 @@ contract TBAgentRegistry is Ownable {
         return agentNFT.getTokenBoundAccount(ownershipTokenId);
     }
     
+    // ========================
+    // Delegation Management
+    // ========================
+    
     // Approve an Address to Serve as a Delegate
-    function setDelegationApproval(uint256 tokenId, address operator, bool approved) external {
+    function setDelegationApproval(uint256 tokenId, address operator, bool approved) external whenNotPaused {
+        require(operator != address(0), "Zero address operator");
         require(agentNFT.ownerOf(tokenId) == msg.sender, "Not token owner");
         _tokenIdOperatorApprovals[tokenId][operator] = approved;
         emit DelegationApproved(tokenId, operator, approved);
@@ -209,6 +261,7 @@ contract TBAgentRegistry is Ownable {
     
     // Set an Address to Operate on the Agent Ownership NFT's Behalf
     function setGlobalOperator(address operator, bool approved) external onlyOwner {
+        require(operator != address(0), "Zero address operator");
         _globalOperators[operator] = approved;
         emit GlobalOperatorSet(operator, approved);
     }
@@ -218,13 +271,19 @@ contract TBAgentRegistry is Ownable {
         return _tokenIdOperatorApprovals[tokenId][operator] || _globalOperators[operator];
     }
     
+    // ========================
+    // Agent Execution Functions
+    // ========================
+    
     // Execute a Call from the Ownership NFT Wallet
     function executeFromAgent(
         uint256 agentId,
         address to,
         uint256 value,
         bytes memory data
-    ) public returns (bytes memory) {
+    ) public whenNotPaused returns (bytes memory) {
+        require(to != address(0), "Zero address recipient");
+        
         // Fetch the ownership token ID from the agentNFT contract
         uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
         require(ownershipTokenId > 0, "No ownership token");
@@ -232,14 +291,9 @@ contract TBAgentRegistry is Ownable {
         // Get the token owner
         address tokenOwner = agentNFT.ownerOf(ownershipTokenId);
         
-        // If the caller is the token owner, they can execute directly
-        if (msg.sender == tokenOwner) {
-            address payable account = payable(agentNFT.getTokenBoundAccount(ownershipTokenId));
-            return IERC6551Account(account).executeCall(to, value, data);
-        }
-        
-        // Otherwise, check if they have delegation approval
+        // Authentication check
         bool isAuthorized = 
+            msg.sender == tokenOwner || // Token owner
             msg.sender == owner() || // Contract owner
             msg.sender == agentNFT.approvedRegistry() || // Approved registry
             isDelegationApproved(ownershipTokenId, msg.sender); // Delegated operator
@@ -248,13 +302,24 @@ contract TBAgentRegistry is Ownable {
         
         // Get the account associated with the ownership token
         address payable account = payable(agentNFT.getTokenBoundAccount(ownershipTokenId));
+        require(account != address(0), "Invalid token bound account");
         
-        // Execute the call to the specified address as delegated operator
-        return IERC6551Account(account).executeCall(to, value, data);
+        // Execute the call to the specified address
+        bytes memory result = IERC6551Account(account).executeCall(to, value, data);
+        require(result.length > 0, "Call execution failed");
+        
+        return result;
     }
     
     // Transfer NEOX tokens from Agent Ownership NFT wallet to another wallet or contract address
-    function executeNEOXTransfer(uint256 agentId, address recipient, uint256 amount) external returns (bytes memory) {
+    function executeNEOXTransfer(
+        uint256 agentId, 
+        address recipient, 
+        uint256 amount
+    ) external whenNotPaused returns (bytes memory) {
+        require(recipient != address(0), "Zero address recipient");
+        require(amount > 0, "Zero amount");
+        
         // Get the NEOX token address
         address neoxTokenAddress = address(neoxToken);
         
@@ -268,19 +333,32 @@ contract TBAgentRegistry is Ownable {
         // Execute the call via the agent's token bound account
         bytes memory result = executeFromAgent(agentId, neoxTokenAddress, 0, data);
         
+        // Verify transfer success
+        bool success = abi.decode(result, (bool));
+        require(success, "Transfer failed");
+        
         emit NEOXTransferred(agentId, recipient, amount);
         
         return result;
     }
     
     // Transfer NFT from Agent Ownership NFT wallet to another wallet or contract address
-    function executeNFTTransfer(uint256 agentId, address nftContract, address recipient, uint256 tokenId) external returns (bytes memory) {
+    function executeNFTTransfer(
+        uint256 agentId, 
+        address nftContract, 
+        address recipient, 
+        uint256 tokenId
+    ) external whenNotPaused returns (bytes memory) {
+        require(nftContract != address(0), "Zero address NFT contract");
+        require(recipient != address(0), "Zero address recipient");
+        
         // Get the agent's token bound account address
         address agentAccount;
         {
             uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
             require(ownershipTokenId > 0, "No ownership token");
             agentAccount = agentNFT.getTokenBoundAccount(ownershipTokenId);
+            require(agentAccount != address(0), "Invalid token bound account");
         }
         
         // Encode the transferFrom function call: transferFrom(address from, address to, uint256 tokenId)
@@ -293,14 +371,19 @@ contract TBAgentRegistry is Ownable {
         
         // Execute the call via the agent's token bound account
         bytes memory result = executeFromAgent(agentId, nftContract, 0, data);
+        require(result.length > 0, "NFT transfer failed");
         
         emit NFTTransferred(agentId, nftContract, recipient, tokenId);
         
         return result;
     }
     
+    // ========================
+    // Purchase and Usage
+    // ========================
+    
     // Purchase Tier Access to an Agent (Tiers 1 - 3)
-    function purchaseTier(uint256 agentId, uint8 tier) external {
+    function purchaseTier(uint256 agentId, uint8 tier) external nonReentrant whenNotPaused {
         require(agents[agentId].active, "Agent not active");
         require(tier >= TIER_BASIC && tier <= TIER_PREMIUM, "Invalid tier");
         
@@ -314,11 +397,22 @@ contract TBAgentRegistry is Ownable {
         }
         
         // Collect tier fee
-        neoxToken.transferFrom(msg.sender, address(this), tierCost);
+        require(neoxToken.transferFrom(msg.sender, address(this), tierCost), "Fee transfer failed");
+        
+        // Calculate fee distribution
+        uint256 creatorAmount = (tierCost * creatorPercentage) / 100;
+        uint256 platformAmount = tierCost - creatorAmount;
+        
+        // Add platform fees to pending withdrawals
+        pendingWithdrawals[owner()] += platformAmount;
         
         // Distribute to NFT holders (70%)
-        uint256 creatorAmount = (tierCost * creatorPercentage) / 100;
-        agentNFT.distributeRevenue(agentId, creatorAmount);
+        bool distributionSuccess = agentNFT.distributeRevenue(agentId, creatorAmount);
+        if (!distributionSuccess) {
+            // If distribution fails, add to pending withdrawals for manual claiming
+            pendingWithdrawals[agents[agentId].creator] += creatorAmount;
+            emit RevenueDistributionFailed(agentId, creatorAmount);
+        }
         
         // Grant tier access
         userTiers[msg.sender][agentId] = tier;
@@ -330,7 +424,7 @@ contract TBAgentRegistry is Ownable {
      * @dev Use an agent (requires tier access)
      * @param agentId Agent ID
      */
-    function useAgent(uint256 agentId) external {
+    function useAgent(uint256 agentId) external nonReentrant whenNotPaused {
         require(agents[agentId].active, "Agent not active");
         
         // Check tier access
@@ -338,20 +432,66 @@ contract TBAgentRegistry is Ownable {
         require(tier > 0, "No tier access");
         
         // Collect usage fee
-        neoxToken.transferFrom(msg.sender, address(this), usageFee);
+        require(neoxToken.transferFrom(msg.sender, address(this), usageFee), "Fee transfer failed");
         
         // Track usage
         agents[agentId].usageCount++;
         
         // Record usage in NFT contract
-        agentNFT.recordUsage(agentId, msg.sender);
+        bool recordSuccess = agentNFT.recordUsage(agentId, msg.sender);
+        require(recordSuccess, "Usage recording failed");
+        
+        // Calculate fee distribution
+        uint256 creatorAmount = (usageFee * creatorPercentage) / 100;
+        uint256 platformAmount = usageFee - creatorAmount;
+        
+        // Add platform fees to pending withdrawals
+        pendingWithdrawals[owner()] += platformAmount;
         
         // Distribute to NFT holders (70%)
-        uint256 creatorAmount = (usageFee * creatorPercentage) / 100;
-        agentNFT.distributeRevenue(agentId, creatorAmount);
+        bool distributionSuccess = agentNFT.distributeRevenue(agentId, creatorAmount);
+        if (!distributionSuccess) {
+            // If distribution fails, add to pending withdrawals for manual claiming
+            pendingWithdrawals[agents[agentId].creator] += creatorAmount;
+            emit RevenueDistributionFailed(agentId, creatorAmount);
+        }
         
         emit AgentUsed(agentId, msg.sender, tier);
     }
+    
+    // ========================
+    // Withdrawal Pattern
+    // ========================
+    
+    /**
+     * @dev Request withdrawal of pending fees
+     */
+    function requestWithdrawal() external nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "No funds to withdraw");
+        
+        // Reset pending withdrawal before transfer to prevent reentrancy
+        pendingWithdrawals[msg.sender] = 0;
+        
+        // Transfer tokens to the user
+        bool success = neoxToken.transfer(msg.sender, amount);
+        require(success, "Transfer failed");
+        
+        emit WithdrawalCompleted(msg.sender, amount);
+    }
+    
+    /**
+     * @dev View pending withdrawal amount
+     * @param user Address to check
+     * @return Amount of tokens available for withdrawal
+     */
+    function getPendingWithdrawal(address user) external view returns (uint256) {
+        return pendingWithdrawals[user];
+    }
+    
+    // ========================
+    // View Functions
+    // ========================
     
     // Get Ownership Token NFT ID
     function getAgentOwnershipToken(uint256 agentId) external view returns (uint256) {
@@ -366,5 +506,29 @@ contract TBAgentRegistry is Ownable {
     // Check if Address is a Global Operator
     function isGlobalOperator(address operator) external view returns (bool) {
         return _globalOperators[operator];
+    }
+    
+    // Get creator agents with pagination
+    function getCreatorAgents(address creator, uint256 offset, uint256 limit) external view returns (uint256[] memory) {
+        uint256[] storage allAgents = creatorAgents[creator];
+        
+        // Bound check
+        if (offset >= allAgents.length) {
+            return new uint256[](0);
+        }
+        
+        // Determine actual count to return
+        uint256 count = (offset + limit > allAgents.length) ? 
+                        (allAgents.length - offset) : 
+                        limit;
+        
+        uint256[] memory result = new uint256[](count);
+        
+        // Copy results with pagination
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = allAgents[offset + i];
+        }
+        
+        return result;
     }
 }
