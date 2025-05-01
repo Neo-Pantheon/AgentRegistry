@@ -30,19 +30,24 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     using Counters for Counters.Counter;
     address public registry;
     
-    // Constants
+    // Variables (previously constants)
     uint256 public creationFee = 25000 * 10**18; // 25,000 NEOX
     uint256 public usageFee = 10 * 10**18;      // 10 NEOX per use
-    uint8 public constant NFT_COUNT = 12;       // Fixed at 12 NFTs per agent
+    uint8 public nftCount = 12;                 // Default 12 NFTs per agent
     
-    // Deployment tiers
-    uint8 public constant TIER_BASIC = 1;
-    uint8 public constant TIER_ADVANCED = 2;
-    uint8 public constant TIER_PREMIUM = 3;
+    // Deployment tiers (made into variables)
+    uint8 public tierBasic = 1;
+    uint8 public tierAdvanced = 2;
+    uint8 public tierPremium = 3;
     
     // Fee distribution
     uint256 public creatorPercentage = 70; // 70% to creator
     uint256 public platformPercentage = 30; // 30% to platform
+    
+    // Tier costs
+    uint256 public basicTierCost = 100 * 10**18;    // 100 NEOX
+    uint256 public advancedTierCost = 500 * 10**18; // 500 NEOX
+    uint256 public premiumTierCost = 2000 * 10**18; // 2000 NEOX
     
     // Counters
     Counters.Counter private _agentIdCounter;
@@ -90,6 +95,11 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     event WithdrawalCompleted(address indexed recipient, uint256 amount);
     event RevenueDistributionFailed(uint256 indexed agentId, uint256 amount);
     event EmergencyWithdraw(address indexed recipient, uint256 amount);
+    event FeesUpdated(uint256 newCreationFee, uint256 newUsageFee);
+    event TierCostsUpdated(uint256 newBasicCost, uint256 newAdvancedCost, uint256 newPremiumCost);
+    event NFTCountUpdated(uint8 newNFTCount);
+    event FeeDistributionUpdated(uint256 newCreatorPercentage, uint256 newPlatformPercentage);
+    event TierValuesUpdated(uint8 newBasicTier, uint8 newAdvancedTier, uint8 newPremiumTier);
     
     constructor(address _neoxToken, address _agentNFT) Ownable(msg.sender) {
         require(_neoxToken != address(0), "Zero address for NEOX token");
@@ -97,6 +107,44 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         
         neoxToken = IERC20(_neoxToken);
         agentNFT = ITBAgentNFT(_agentNFT);
+    }
+    
+    // ========================
+    // Configuration Functions
+    // ========================
+    
+    function updateFees(uint256 _creationFee, uint256 _usageFee) external onlyOwner {
+        creationFee = _creationFee;
+        usageFee = _usageFee;
+        emit FeesUpdated(_creationFee, _usageFee);
+    }
+    
+    function updateTierCosts(uint256 _basicTierCost, uint256 _advancedTierCost, uint256 _premiumTierCost) external onlyOwner {
+        basicTierCost = _basicTierCost;
+        advancedTierCost = _advancedTierCost;
+        premiumTierCost = _premiumTierCost;
+        emit TierCostsUpdated(_basicTierCost, _advancedTierCost, _premiumTierCost);
+    }
+    
+    function updateNFTCount(uint8 _nftCount) external onlyOwner {
+        require(_nftCount > 0, "NFT count must be positive");
+        nftCount = _nftCount;
+        emit NFTCountUpdated(_nftCount);
+    }
+    
+    function updateFeeDistribution(uint256 _creatorPercentage) external onlyOwner {
+        require(_creatorPercentage <= 100, "Creator percentage too high");
+        creatorPercentage = _creatorPercentage;
+        platformPercentage = 100 - _creatorPercentage;
+        emit FeeDistributionUpdated(_creatorPercentage, platformPercentage);
+    }
+    
+    function updateTierValues(uint8 _tierBasic, uint8 _tierAdvanced, uint8 _tierPremium) external onlyOwner {
+        require(_tierBasic < _tierAdvanced && _tierAdvanced < _tierPremium, "Tiers must be in ascending order");
+        tierBasic = _tierBasic;
+        tierAdvanced = _tierAdvanced;
+        tierPremium = _tierPremium;
+        emit TierValuesUpdated(_tierBasic, _tierAdvanced, _tierPremium);
     }
     
     // ========================
@@ -126,7 +174,7 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     // Main Functions
     // ========================
     
-    // Create The AI Agent 12 NFTs & Ownership NFT Token (agentType is 0 = Builder, 1 = Researcher, 2 = Socialite)
+    // Create The AI Agent NFTs & Ownership NFT Token (agentType is 0 = Builder, 1 = Researcher, 2 = Socialite)
     function createAgent(
         string memory name,
         string memory symbol,
@@ -164,8 +212,8 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         // Track creator's agents
         creatorAgents[msg.sender].push(agentId);
 
-        // Mint exactly 12 NFTs to creator (regular revenue-sharing NFTs)
-        for (uint8 i = 0; i < NFT_COUNT; i++) {
+        // Mint NFTs to creator (regular revenue-sharing NFTs)
+        for (uint8 i = 0; i < nftCount; i++) {
             agentNFT.createAgent(
                 msg.sender,
                 agentId,
@@ -187,7 +235,7 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         );
 
         // Auto-grant the creator premium tier access
-        userTiers[msg.sender][agentId] = TIER_PREMIUM;
+        userTiers[msg.sender][agentId] = tierPremium;
 
         emit AgentCreated(agentId, msg.sender, agentType, name, customURI);
 
@@ -220,7 +268,7 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         creatorAgents[newOwner].push(agentId);
         
         // Grant premium tier access to the new owner
-        userTiers[newOwner][agentId] = TIER_PREMIUM;
+        userTiers[newOwner][agentId] = tierPremium;
         
         emit AgentOwnershipTransferred(agentId, previousOwner, newOwner, ownershipTokenId);
     }
@@ -385,15 +433,15 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     // Purchase Tier Access to an Agent (Tiers 1 - 3)
     function purchaseTier(uint256 agentId, uint8 tier) external nonReentrant whenNotPaused {
         require(agents[agentId].active, "Agent not active");
-        require(tier >= TIER_BASIC && tier <= TIER_PREMIUM, "Invalid tier");
+        require(tier >= tierBasic && tier <= tierPremium, "Invalid tier");
         
         uint256 tierCost;
-        if (tier == TIER_BASIC) {
-            tierCost = 100 * 10**18; // 100 NEOX
-        } else if (tier == TIER_ADVANCED) {
-            tierCost = 500 * 10**18; // 500 NEOX
-        } else if (tier == TIER_PREMIUM) {
-            tierCost = 2000 * 10**18; // 2000 NEOX
+        if (tier == tierBasic) {
+            tierCost = basicTierCost;
+        } else if (tier == tierAdvanced) {
+            tierCost = advancedTierCost;
+        } else if (tier == tierPremium) {
+            tierCost = premiumTierCost;
         }
         
         // Collect tier fee
@@ -406,7 +454,7 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         // Add platform fees to pending withdrawals
         pendingWithdrawals[owner()] += platformAmount;
         
-        // Distribute to NFT holders (70%)
+        // Distribute to NFT holders
         bool distributionSuccess = agentNFT.distributeRevenue(agentId, creatorAmount);
         if (!distributionSuccess) {
             // If distribution fails, add to pending withdrawals for manual claiming
@@ -448,7 +496,7 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         // Add platform fees to pending withdrawals
         pendingWithdrawals[owner()] += platformAmount;
         
-        // Distribute to NFT holders (70%)
+        // Distribute to NFT holders
         bool distributionSuccess = agentNFT.distributeRevenue(agentId, creatorAmount);
         if (!distributionSuccess) {
             // If distribution fails, add to pending withdrawals for manual claiming
