@@ -4,6 +4,8 @@ pragma solidity 0.8.26;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol"; // Added SafeERC20
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 
@@ -28,21 +30,15 @@ error TokenOperationFailed(string operation);
 error NoTierAccess(address user, uint256 agentId);
 error InterfaceValidationFailed(address contractAddress, bytes4 interfaceId);
 error InvalidTokenBoundAccount(address account);
+error ValidationFailed(string parameter, string reason);
+error ResultValidationFailed(string operation, bytes reason);
+error InvalidParameter(string name, string reason);
+error RateLimitNotElapsed(address user, uint256 agentId, uint256 lastUsed, uint256 cooldown);
 
-// Interface definitions with proper interface IDs for validation
 interface IERC6551Account {
-    // Function to receive Ether
     receive() external payable;
-    
-    // Returns the token associated with this account
     function token() external view returns (uint256 chainId, address tokenContract, uint256 tokenId);
-    
-    // Executes a transaction from the account
     function executeCall(address to, uint256 value, bytes calldata data) external payable returns (bytes memory);
-    
-    // ERC-165 interface ID for ERC6551Account
-    // keccak256("IERC6551Account") = 0x6faff5f1
-    function supportsInterface(bytes4 interfaceId) external view returns (bool);
 }
 
 interface ITBAgentNFT {
@@ -56,29 +52,22 @@ interface ITBAgentNFT {
     function transferFrom(address from, address to, uint256 tokenId) external;
     function approvedRegistry() external view returns (address);
     function symbolOfToken(uint256 tokenId) external view returns (string memory);
-    
-    // ERC-165 interface ID for TBAgentNFT
-    // Example ID, actual implementation should calculate this from the interface definition
-    function supportsInterface(bytes4 interfaceId) external view returns (bool);
-}
-
-interface IERC165 {
-    function supportsInterface(bytes4 interfaceId) external view returns (bool);
 }
 
 contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     using Counters for Counters.Counter;
+    using SafeERC20 for IERC20; // Using SafeERC20 now
     address public registry;
     
     // Variables (previously constants)
     uint256 public creationFee = 25000 * 10**18; // 25,000 NEOX
     uint256 public usageFee = 10 * 10**18;      // 10 NEOX per use
-    uint8 public nftCount = 12;                 // Default 12 NFTs per agent
+    uint256 public nftCount = 12;                 // Default 12 NFTs per agent
     
     // Deployment tiers (made into variables)
-    uint8 public tierBasic = 1;
-    uint8 public tierAdvanced = 2;
-    uint8 public tierPremium = 3;
+    uint256 public tierBasic = 1;
+    uint256 public tierAdvanced = 2;
+    uint256 public tierPremium = 3;
     
     // Fee distribution
     uint256 public creatorPercentage = 70; // 70% to creator
@@ -90,13 +79,7 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     uint256 public premiumTierCost = 2000 * 10**18; // 2000 NEOX
     
     // Rate limiting
-    uint64 public creationCooldown = 1 hours;  // Cooldown between agent creations
-    uint64 public usageCooldown = 5 minutes;   // Cooldown between agent usage
-    uint64 public tierPurchaseCooldown = 1 days; // Cooldown between tier purchases
-    
-    // Interface IDs for validation
-    bytes4 private constant IERC6551Account_ID = 0x6faff5f1; // Calculate this from the interface
-    bytes4 private constant ITBAgentNFT_ID = 0x123abc45; // Replace with actual interface ID
+    uint256 public usageCooldown = 5 minutes; // Default cooldown period between uses
     
     // Counters
     Counters.Counter private _agentIdCounter;
@@ -104,6 +87,10 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     // Contracts
     IERC20 public neoxToken;
     ITBAgentNFT public agentNFT;
+    
+    // Accepted ERC20 tokens
+    mapping(address => bool) public acceptedTokens;
+    address[] public acceptedTokensList;
     
     // Withdrawal pattern
     mapping(address => uint256) public pendingWithdrawals;
@@ -122,13 +109,10 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         string customURI;  // Custom token URI
     }
     
-    // Rate Limiting structures
-    struct UserRateLimits {
-        uint64 lastCreationTime;
-        mapping(uint256 => uint64) lastAgentUsageTime;
-        mapping(uint256 => uint64) lastTierPurchaseTime;
-        uint256 agentCreationCount24h;
-        uint64 last24hReset;
+    // Rate limiting structure
+    struct UsageData {
+        uint256 lastUsageTime;
+        uint256 totalUsage;
     }
     
     // Delegation structures
@@ -139,227 +123,260 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     mapping(uint256 => Agent) public agents;
     mapping(address => uint256[]) public creatorAgents;
     mapping(address => mapping(uint256 => uint8)) public userTiers; // user => agentId => tier
-    mapping(address => UserRateLimits) private _userRateLimits;
-    
-    // Constants for rate limiting
-    uint256 private constant MAX_AGENT_CREATIONS_24H = 5;
-    uint64 private constant SECONDS_IN_24H = 86400;
+    mapping(address => mapping(uint256 => UsageData)) public usageHistory; // Rate limiting data
     
     // Events
     event AgentCreated(uint256 indexed agentId, address indexed creator, uint8 agentType, string name, string customURI);
-    event AgentUsed(uint256 indexed agentId, address indexed user, uint8 tier);
-    event TierPurchased(uint256 indexed agentId, address indexed user, uint8 tier);
+    event AgentUsed(uint256 indexed agentId, address indexed user, uint8 tier, uint256 timestamp);
+    event TierPurchased(uint256 indexed agentId, address indexed user, uint8 tier, uint256 amount);
     event AgentOwnershipTransferred(uint256 indexed agentId, address indexed previousOwner, address indexed newOwner, uint256 ownershipTokenId);
     event DelegationApproved(uint256 indexed tokenId, address indexed operator, bool approved);
     event GlobalOperatorSet(address indexed operator, bool approved);
-    event NEOXTransferred(uint256 indexed agentId, address indexed recipient, uint256 amount);
+    event NEOXTransferred(uint256 indexed agentId, address indexed recipient, uint256 amount, bool success);
     event NFTTransferred(uint256 indexed agentId, address indexed nftContract, address indexed recipient, uint256 tokenId);
     event WithdrawalRequested(address indexed recipient, uint256 amount);
     event WithdrawalCompleted(address indexed recipient, uint256 amount);
-    event RevenueDistributionFailed(uint256 indexed agentId, uint256 amount, string reason);
+    event RevenueDistributionFailed(uint256 indexed agentId, uint256 amount, address fallbackRecipient);
     event EmergencyWithdraw(address indexed recipient, uint256 amount);
     event FeesUpdated(uint256 newCreationFee, uint256 newUsageFee);
     event TierCostsUpdated(uint256 newBasicCost, uint256 newAdvancedCost, uint256 newPremiumCost);
     event NFTCountUpdated(uint8 newNFTCount);
     event FeeDistributionUpdated(uint256 newCreatorPercentage, uint256 newPlatformPercentage);
     event TierValuesUpdated(uint8 newBasicTier, uint8 newAdvancedTier, uint8 newPremiumTier);
-    event RateLimitsUpdated(uint64 newCreationCooldown, uint64 newUsageCooldown, uint64 newTierPurchaseCooldown);
-    event InterfaceValidated(address contractAddress, bytes4 interfaceId);
+    event RateLimitUpdated(uint256 newCooldownPeriod);
+    event AgentConfigurationUpdated(uint256 indexed agentId, string field, string newValue);
+    event AgentStatusChanged(uint256 indexed agentId, bool active);
+    event AgentRateLimitExceeded(address indexed user, uint256 indexed agentId, uint256 lastUsage, uint256 cooldownPeriod);
+    event OperationAttempted(string operation, address indexed user, bool success);
+    event ValidationError(string parameter, string reason);
+    event DelegationStatusCheck(uint256 tokenId, address operator, bool status);
+    event TokenAdded(address indexed tokenAddress, string tokenSymbol);
+    event TokenRemoved(address indexed tokenAddress, string tokenSymbol);
     
     constructor(address _neoxToken, address _agentNFT) Ownable(msg.sender) {
-        if (_neoxToken == address(0)) revert ZeroAddress("NEOX token");
-        if (_agentNFT == address(0)) revert ZeroAddress("Agent NFT");
+        if (_neoxToken == address(0)) revert ZeroAddress("neoxToken");
+        if (_agentNFT == address(0)) revert ZeroAddress("agentNFT");
         
         neoxToken = IERC20(_neoxToken);
         agentNFT = ITBAgentNFT(_agentNFT);
         
-        // Validate interfaces
-        _validateInterface(_agentNFT, ITBAgentNFT_ID);
+        // Add the NEOX token as an accepted token by default
+        acceptedTokens[_neoxToken] = true;
+        acceptedTokensList.push(_neoxToken);
+        
+        emit OperationAttempted("Constructor", msg.sender, true);
+    }
+    
+    // Validate string inputs
+    function _validateString(string memory value, string memory paramName, uint256 minLength, uint256 maxLength) internal pure {
+        uint256 length = bytes(value).length;
+        if (length < minLength) revert StringTooShort(paramName, minLength, length);
+        if (maxLength > 0 && length > maxLength) revert StringTooLong(paramName, maxLength, length);
+    }
+    
+    // Validate address inputs 
+    function _validateAddress(address value, string memory paramName) internal pure {
+        if (value == address(0)) revert ZeroAddress(paramName);
+    }
+    
+    // Validate numeric range
+    function _validateRange(uint256 value, string memory paramName, uint256 min, uint256 max) internal pure {
+        if (value < min) revert InvalidParameter(paramName, "Value too low");
+        if (max > 0 && value > max) revert InvalidParameter(paramName, "Value too high");
     }
     
     // ========================
-    // Interface Validation
+    // ERC20 Token Management
     // ========================
     
     /**
-     * @dev Validates that a contract supports a specific interface
-     * @param contractAddress The address of the contract to validate
-     * @param interfaceId The interface ID to check
+     * @dev Add an ERC20 token to the list of accepted tokens
+     * @param tokenAddress The address of the ERC20 token contract
      */
-    function _validateInterface(address contractAddress, bytes4 interfaceId) internal {
-        try IERC165(contractAddress).supportsInterface(interfaceId) returns (bool supported) {
-            if (!supported) {
-                revert InterfaceValidationFailed(contractAddress, interfaceId);
-            }
-            emit InterfaceValidated(contractAddress, interfaceId);
+    function addAcceptedToken(address tokenAddress) external onlyOwner {
+        _validateAddress(tokenAddress, "tokenAddress");
+        
+        // Check if token is already accepted
+        if (acceptedTokens[tokenAddress]) revert ValidationFailed("tokenAddress", "Token already accepted");
+        
+        // Try to get token symbol (basic validation that it's an ERC20)
+        string memory symbol;
+        try IERC20Metadata(tokenAddress).symbol() returns (string memory s) {
+            symbol = s;
         } catch {
-            revert InterfaceValidationFailed(contractAddress, interfaceId);
-        }
-    }
-    
-    /**
-     * @dev Validates that an account implements the ERC6551Account interface
-     * @param account The token bound account to validate
-     */
-    function _validateTokenBoundAccount(address account) internal view {
-        if (account == address(0)) {
-            revert ZeroAddress("Token bound account");
+            revert InterfaceValidationFailed(tokenAddress, IERC20Metadata.symbol.selector);
         }
         
-        try IERC165(account).supportsInterface(IERC6551Account_ID) returns (bool supported) {
-            if (!supported) {
-                revert InvalidTokenBoundAccount(account);
-            }
-        } catch {
-            revert InvalidTokenBoundAccount(account);
-        }
+        // Add token to accepted list
+        acceptedTokens[tokenAddress] = true;
+        acceptedTokensList.push(tokenAddress);
+        
+        emit TokenAdded(tokenAddress, symbol);
+        emit OperationAttempted("addAcceptedToken", msg.sender, true);
     }
     
-    // ========================
-    // Configuration Functions
-    // ========================
+    /**
+     * @dev Remove an ERC20 token from the list of accepted tokens
+     * @param tokenAddress The address of the ERC20 token to remove
+     */
+    function removeAcceptedToken(address tokenAddress) external onlyOwner {
+        // Cannot remove the primary NEOX token
+        if (tokenAddress == address(neoxToken)) revert ValidationFailed("tokenAddress", "Cannot remove primary token");
+        
+        // Check if token is currently accepted
+        if (!acceptedTokens[tokenAddress]) revert ValidationFailed("tokenAddress", "Token not in accepted list");
+        
+        // Try to get token symbol for the event
+        string memory symbol;
+        try IERC20Metadata(tokenAddress).symbol() returns (string memory s) {
+            symbol = s;
+        } catch {
+            symbol = "UNKNOWN";
+        }
+        
+        // Remove from mapping
+        acceptedTokens[tokenAddress] = false;
+        
+        // Remove from array
+        for (uint256 i = 0; i < acceptedTokensList.length; i++) {
+            if (acceptedTokensList[i] == tokenAddress) {
+                // Swap with the last element and pop (gas efficient)
+                if (i < acceptedTokensList.length - 1) {
+                    acceptedTokensList[i] = acceptedTokensList[acceptedTokensList.length - 1];
+                }
+                acceptedTokensList.pop();
+                break;
+            }
+        }
+        
+        emit TokenRemoved(tokenAddress, symbol);
+        emit OperationAttempted("removeAcceptedToken", msg.sender, true);
+    }
     
     /**
-     * @dev Update fees for creation and usage
-     * @param _creationFee New fee for creating an agent
-     * @param _usageFee New fee for using an agent
+     * @dev Get the list of all accepted tokens
+     * @return List of accepted token addresses
      */
+    function getAcceptedTokens() external view returns (address[] memory) {
+        return acceptedTokensList;
+    }
+    
+    /**
+     * @dev Check if a token is accepted
+     * @param tokenAddress The token address to check
+     * @return True if the token is accepted
+     */
+    function isTokenAccepted(address tokenAddress) external view returns (bool) {
+        return acceptedTokens[tokenAddress];
+    }
+    
+    /**
+     * @dev Execute a transfer of any accepted ERC20 token from agent wallet
+     * @param agentId The agent ID
+     * @param tokenAddress The ERC20 token address
+     * @param recipient The recipient address
+     * @param amount The amount to transfer
+     */
+    function executeTokenTransfer(
+        uint256 agentId,
+        address tokenAddress,
+        address recipient,
+        uint256 amount
+    ) external whenNotPaused returns (bytes memory) {
+        _validateAddress(tokenAddress, "tokenAddress");
+        _validateAddress(recipient, "recipient");
+        _validateRange(amount, "amount", 1, 0);
+        
+        // Check if token is accepted
+        if (!acceptedTokens[tokenAddress]) revert ValidationFailed("tokenAddress", "Token not accepted");
+        
+        // Encode the transfer function call: transfer(address to, uint256 amount)
+        bytes memory data = abi.encodeWithSignature(
+            "transfer(address,uint256)",
+            recipient,
+            amount
+        );
+        
+        // Execute the call via the agent's token bound account
+        bytes memory result = executeFromAgent(agentId, tokenAddress, 0, data);
+        
+        // Verify transfer success
+        bool success = abi.decode(result, (bool));
+        if (!success) revert TokenOperationFailed("transfer");
+        
+        // Get token symbol if possible
+        string memory symbol;
+        try IERC20Metadata(tokenAddress).symbol() returns (string memory s) {
+            symbol = s;
+        } catch {
+            symbol = "UNKNOWN";
+        }
+        
+        emit NEOXTransferred(agentId, recipient, amount, success);
+        emit OperationAttempted("executeTokenTransfer", msg.sender, true);
+        
+        return result;
+    }
+    
     function updateFees(uint256 _creationFee, uint256 _usageFee) external onlyOwner {
+        _validateRange(_creationFee, "creationFee", 0, 0);
+        _validateRange(_usageFee, "usageFee", 0, 0);
+        
         creationFee = _creationFee;
         usageFee = _usageFee;
+        
         emit FeesUpdated(_creationFee, _usageFee);
+        emit OperationAttempted("updateFees", msg.sender, true);
     }
     
-    /**
-     * @dev Update costs for different tiers
-     * @param _basicTierCost Cost for basic tier
-     * @param _advancedTierCost Cost for advanced tier
-     * @param _premiumTierCost Cost for premium tier
-     */
     function updateTierCosts(uint256 _basicTierCost, uint256 _advancedTierCost, uint256 _premiumTierCost) external onlyOwner {
+        _validateRange(_basicTierCost, "basicTierCost", 0, 0);
+        _validateRange(_advancedTierCost, "advancedTierCost", _basicTierCost, 0);
+        _validateRange(_premiumTierCost, "premiumTierCost", _advancedTierCost, 0);
+        
         basicTierCost = _basicTierCost;
         advancedTierCost = _advancedTierCost;
         premiumTierCost = _premiumTierCost;
+        
         emit TierCostsUpdated(_basicTierCost, _advancedTierCost, _premiumTierCost);
+        emit OperationAttempted("updateTierCosts", msg.sender, true);
     }
     
-    /**
-     * @dev Update number of NFTs created per agent
-     * @param _nftCount New NFT count per agent
-     */
     function updateNFTCount(uint8 _nftCount) external onlyOwner {
         if (_nftCount == 0) revert NFTCountMustBePositive();
+        
         nftCount = _nftCount;
+        
         emit NFTCountUpdated(_nftCount);
+        emit OperationAttempted("updateNFTCount", msg.sender, true);
     }
     
-    /**
-     * @dev Update fee distribution between creators and platform
-     * @param _creatorPercentage Percentage of fees given to creators (0-100)
-     */
     function updateFeeDistribution(uint256 _creatorPercentage) external onlyOwner {
         if (_creatorPercentage > 100) revert PercentageTooHigh(_creatorPercentage, 100);
+        
         creatorPercentage = _creatorPercentage;
         platformPercentage = 100 - _creatorPercentage;
+        
         emit FeeDistributionUpdated(_creatorPercentage, platformPercentage);
+        emit OperationAttempted("updateFeeDistribution", msg.sender, true);
     }
     
-    /**
-     * @dev Update tier values
-     * @param _tierBasic Value for basic tier
-     * @param _tierAdvanced Value for advanced tier
-     * @param _tierPremium Value for premium tier
-     */
     function updateTierValues(uint8 _tierBasic, uint8 _tierAdvanced, uint8 _tierPremium) external onlyOwner {
-        if (!(_tierBasic < _tierAdvanced && _tierAdvanced < _tierPremium)) {
-            revert TiersNotAscending();
-        }
+        if (!(_tierBasic < _tierAdvanced && _tierAdvanced < _tierPremium)) revert TiersNotAscending();
+        
         tierBasic = _tierBasic;
         tierAdvanced = _tierAdvanced;
         tierPremium = _tierPremium;
+        
         emit TierValuesUpdated(_tierBasic, _tierAdvanced, _tierPremium);
+        emit OperationAttempted("updateTierValues", msg.sender, true);
     }
     
-    /**
-     * @dev Update rate limiting parameters
-     * @param _creationCooldown Cooldown between agent creations
-     * @param _usageCooldown Cooldown between agent usages
-     * @param _tierPurchaseCooldown Cooldown between tier purchases
-     */
-    function updateRateLimits(
-        uint64 _creationCooldown,
-        uint64 _usageCooldown,
-        uint64 _tierPurchaseCooldown
-    ) external onlyOwner {
-        creationCooldown = _creationCooldown;
+    function updateRateLimit(uint256 _usageCooldown) external onlyOwner {
         usageCooldown = _usageCooldown;
-        tierPurchaseCooldown = _tierPurchaseCooldown;
-        emit RateLimitsUpdated(_creationCooldown, _usageCooldown, _tierPurchaseCooldown);
-    }
-    
-    // ========================
-    // Rate Limiting Functions
-    // ========================
-    
-    /**
-     * @dev Check and update creation rate limits
-     * @param user Address to check
-     */
-    function _checkCreationRateLimit(address user) internal {
-        UserRateLimits storage limits = _userRateLimits[user];
         
-        // Check cooldown period
-        if (block.timestamp < limits.lastCreationTime + creationCooldown) {
-            revert RateLimitExceeded(user, 0, creationCooldown);
-        }
-        
-        // Check 24h limit
-        if (block.timestamp >= limits.last24hReset + SECONDS_IN_24H) {
-            // Reset 24h counter
-            limits.agentCreationCount24h = 1;
-            limits.last24hReset = uint64(block.timestamp);
-        } else {
-            // Increment counter and check limit
-            limits.agentCreationCount24h++;
-            if (limits.agentCreationCount24h > MAX_AGENT_CREATIONS_24H) {
-                revert RateLimitExceeded(user, 0, uint64(limits.last24hReset + SECONDS_IN_24H - block.timestamp));
-            }
-        }
-        
-        // Update last creation time
-        limits.lastCreationTime = uint64(block.timestamp);
-    }
-    
-    /**
-     * @dev Check and update usage rate limit
-     * @param user Address to check
-     * @param agentId Agent ID being used
-     */
-    function _checkUsageRateLimit(address user, uint256 agentId) internal {
-        UserRateLimits storage limits = _userRateLimits[user];
-        uint64 lastUsage = limits.lastAgentUsageTime[agentId];
-        
-        if (block.timestamp < lastUsage + usageCooldown) {
-            revert RateLimitExceeded(user, agentId, usageCooldown);
-        }
-        
-        limits.lastAgentUsageTime[agentId] = uint64(block.timestamp);
-    }
-    
-    /**
-     * @dev Check and update tier purchase rate limit
-     * @param user Address to check
-     * @param agentId Agent ID for which tier is being purchased
-     */
-    function _checkTierPurchaseRateLimit(address user, uint256 agentId) internal {
-        UserRateLimits storage limits = _userRateLimits[user];
-        uint64 lastPurchase = limits.lastTierPurchaseTime[agentId];
-        
-        if (block.timestamp < lastPurchase + tierPurchaseCooldown) {
-            revert RateLimitExceeded(user, agentId, tierPurchaseCooldown);
-        }
-        
-        limits.lastTierPurchaseTime[agentId] = uint64(block.timestamp);
+        emit RateLimitUpdated(_usageCooldown);
+        emit OperationAttempted("updateRateLimit", msg.sender, true);
     }
     
     // ========================
@@ -368,42 +385,31 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     
     function pause() external onlyOwner {
         _pause();
+        emit OperationAttempted("pause", msg.sender, true);
     }
     
     function unpause() external onlyOwner {
         _unpause();
+        emit OperationAttempted("unpause", msg.sender, true);
     }
     
-    /**
-     * @dev Emergency withdrawal of all tokens
-     * @param recipient Address to receive tokens
-     */
     function emergencyWithdraw(address recipient) external onlyOwner {
-        if (recipient == address(0)) revert ZeroAddress("Recipient");
+        _validateAddress(recipient, "recipient");
         
         uint256 balance = neoxToken.balanceOf(address(this));
         if (balance == 0) revert InsufficientFunds(1, 0);
         
-        bool success = neoxToken.transfer(recipient, balance);
-        if (!success) revert TransferFailed("Emergency withdrawal failed");
+        neoxToken.safeTransfer(recipient, balance);
         
         emit EmergencyWithdraw(recipient, balance);
+        emit OperationAttempted("emergencyWithdraw", msg.sender, true);
     }
     
     // ========================
     // Main Functions
     // ========================
     
-    /**
-     * @dev Create a new AI Agent with NFTs & Ownership Token
-     * @param name Agent name
-     * @param symbol Token symbol
-     * @param agentType Agent type (0=Builder, 1=Researcher, 2=Socialite)
-     * @param personality Agent personality description
-     * @param modelConfig Model configuration
-     * @param customURI Custom token URI
-     * @return agentId The ID of the created agent
-     */
+    // Create The AI Agent NFTs & Ownership NFT Token (agentType is 0 = Builder, 1 = Researcher, 2 = Socialite)
     function createAgent(
         string memory name,
         string memory symbol,
@@ -412,24 +418,17 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         string memory modelConfig,
         string memory customURI
     ) external nonReentrant whenNotPaused returns (uint256) {
-        // Validate inputs
-        uint256 nameLength = bytes(name).length;
-        if (nameLength < 3) revert StringTooShort("name", 3, nameLength);
-        
-        uint256 symbolLength = bytes(symbol).length;
-        if (symbolLength < 2) revert StringTooShort("symbol", 2, symbolLength);
-        if (symbolLength > 6) revert StringTooLong("symbol", 6, symbolLength);
+        // Enhanced input validation
+        _validateString(name, "name", 3, 50);
+        _validateString(symbol, "symbol", 2, 6);
+        _validateString(customURI, "customURI", 1, 256);
+        _validateString(personality, "personality", 1, 1000);
+        _validateString(modelConfig, "modelConfig", 1, 1000);
         
         if (agentType > 2) revert InvalidAgentType(agentType, 2);
-        
-        if (bytes(customURI).length == 0) revert StringTooShort("customURI", 1, 0);
 
-        // Check rate limits
-        _checkCreationRateLimit(msg.sender);
-
-        // Collect creation fee with proper checks
-        bool feeCollected = neoxToken.transferFrom(msg.sender, address(this), creationFee);
-        if (!feeCollected) revert TransferFailed("Creation fee collection failed");
+        // Collect creation fee with proper checks using SafeERC20
+        neoxToken.safeTransferFrom(msg.sender, address(this), creationFee);
 
         // Generate agent ID
         uint256 agentId = _agentIdCounter.current();
@@ -454,56 +453,42 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
 
         // Mint NFTs to creator (regular revenue-sharing NFTs)
         for (uint8 i = 0; i < nftCount; i++) {
-            try agentNFT.createAgent(
+            agentNFT.createAgent(
                 msg.sender,
                 agentId,
                 agentType,
                 name,
                 symbol,
                 customURI
-            ) returns (uint256) {
-                // NFT created successfully
-            } catch Error(string memory reason) {
-                revert TokenOperationFailed(reason);
-            } catch {
-                revert TokenOperationFailed("Agent NFT creation failed");
-            }
+            );
         }
 
-        // Mint special ERC6551 ownership NFT to creator
-        uint256 ownershipTokenId;
-        try agentNFT.createOwnershipToken(
+        // Mint special ERC6551 ownership NFT to creator and store the ID
+        uint256 ownershipTokenId = agentNFT.createOwnershipToken(
             msg.sender,
             agentId,
             agentType,
             name,
             symbol,
             customURI
-        ) returns (uint256 tokenId) {
-            ownershipTokenId = tokenId;
-        } catch Error(string memory reason) {
-            revert TokenOperationFailed(reason);
-        } catch {
-            revert TokenOperationFailed("Ownership token creation failed");
-        }
+        );
+        
+        // Emit an event with the ownership token ID for tracking
+        emit AgentOwnershipTransferred(agentId, address(0), msg.sender, ownershipTokenId);
 
         // Auto-grant the creator premium tier access
-        userTiers[msg.sender][agentId] = tierPremium;
+        userTiers[msg.sender][agentId] = uint8(tierPremium);
 
         emit AgentCreated(agentId, msg.sender, agentType, name, customURI);
+        emit OperationAttempted("createAgent", msg.sender, true);
 
         return agentId;
     }
     
-    /**
-     * @dev Transfer ownership of an agent to a new owner
-     * @param agentId Agent ID to transfer
-     * @param newOwner Address of the new owner
-     */
+    // Transfer Agent Ownership
     function transferAgentOwnership(uint256 agentId, address newOwner) external nonReentrant whenNotPaused {
-        // Validate inputs
         if (!agents[agentId].active) revert AgentNotActive(agentId);
-        if (newOwner == address(0)) revert ZeroAddress("New owner");
+        _validateAddress(newOwner, "newOwner");
         
         // Get the ownership token ID
         uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
@@ -514,13 +499,7 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         if (currentOwner != msg.sender) revert NotAgentOwner(agentId, msg.sender, currentOwner);
         
         // Transfer the ownership token to the new owner
-        try agentNFT.transferFrom(msg.sender, newOwner, ownershipTokenId) {
-            // Transfer successful
-        } catch Error(string memory reason) {
-            revert TokenOperationFailed(reason);
-        } catch {
-            revert TokenOperationFailed("Token transfer failed");
-        }
+        agentNFT.transferFrom(msg.sender, newOwner, ownershipTokenId);
         
         // Update the agent creator
         address previousOwner = agents[agentId].creator;
@@ -533,16 +512,13 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         creatorAgents[newOwner].push(agentId);
         
         // Grant premium tier access to the new owner
-        userTiers[newOwner][agentId] = tierPremium;
+        userTiers[newOwner][agentId] = uint8(tierPremium);
         
         emit AgentOwnershipTransferred(agentId, previousOwner, newOwner, ownershipTokenId);
+        emit OperationAttempted("transferAgentOwnership", msg.sender, true);
     }
     
-    /**
-     * @dev Helper function to remove agent from creator's list
-     * @param creator Address of creator
-     * @param agentId Agent ID to remove
-     */
+    // Helper function to remove agent from creator's list
     function _removeAgentFromCreator(address creator, uint256 agentId) internal {
         uint256[] storage creatorAgentsList = creatorAgents[creator];
         for (uint256 i = 0; i < creatorAgentsList.length; i++) {
@@ -557,11 +533,7 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         }
     }
     
-    /**
-     * @dev Get token bound account address for an agent
-     * @param agentId Agent ID
-     * @return Address of the token bound account
-     */
+    // Get Ownership NFT wallet address
     function getAgentTokenBoundAccount(uint256 agentId) external view returns (address) {
         uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
         if (ownershipTokenId == 0) revert NoOwnershipToken(agentId);
@@ -576,62 +548,53 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     // Delegation Management
     // ========================
     
-    /**
-     * @dev Approve an address to serve as a delegate for a token
-     * @param tokenId Token ID to delegate
-     * @param operator Address to approve as delegate
-     * @param approved Approval status
-     */
+    // Approve an Address to Serve as a Delegate
     function setDelegationApproval(uint256 tokenId, address operator, bool approved) external whenNotPaused {
-        if (operator == address(0)) revert ZeroAddress("Operator");
+        _validateAddress(operator, "operator");
         
         address tokenOwner = agentNFT.ownerOf(tokenId);
-        if (tokenOwner != msg.sender) revert NotAgentOwner(0, msg.sender, tokenOwner);
+        if (tokenOwner != msg.sender) revert NotAuthorized(msg.sender, tokenId);
         
         _tokenIdOperatorApprovals[tokenId][operator] = approved;
+        
         emit DelegationApproved(tokenId, operator, approved);
+        emit OperationAttempted("setDelegationApproval", msg.sender, true);
     }
     
-    /**
-     * @dev Set a global operator that can operate on behalf of any token
-     * @param operator Address to set as global operator
-     * @param approved Approval status
-     */
+    // Set an Address to Operate on the Agent Ownership NFT's Behalf
     function setGlobalOperator(address operator, bool approved) external onlyOwner {
-        if (operator == address(0)) revert ZeroAddress("Operator");
+        _validateAddress(operator, "operator");
+        
         _globalOperators[operator] = approved;
+        
         emit GlobalOperatorSet(operator, approved);
+        emit OperationAttempted("setGlobalOperator", msg.sender, true);
     }
     
-    /**
-     * @dev Check if an address is approved to operate on behalf of a token
-     * @param tokenId Token ID
-     * @param operator Address to check
-     * @return bool True if approved
-     */
+    // Check if an Address is Approved To Operate on Agent Ownership NFT's Behalf
     function isDelegationApproved(uint256 tokenId, address operator) public view returns (bool) {
         return _tokenIdOperatorApprovals[tokenId][operator] || _globalOperators[operator];
+    }
+    
+    // Non-view version that emits an event - can be used when event emission is desired
+    function checkAndLogDelegationStatus(uint256 tokenId, address operator) public returns (bool) {
+        bool status = isDelegationApproved(tokenId, operator);
+        emit DelegationStatusCheck(tokenId, operator, status);
+        return status;
     }
     
     // ========================
     // Agent Execution Functions
     // ========================
     
-    /**
-     * @dev Execute a call from an agent's token bound account
-     * @param agentId Agent ID
-     * @param to Destination address
-     * @param value ETH value to send
-     * @param data Call data
-     * @return bytes Return data from the call
-     */
+    // Execute a Call from the Ownership NFT Wallet
     function executeFromAgent(
         uint256 agentId,
         address to,
         uint256 value,
         bytes memory data
     ) public whenNotPaused returns (bytes memory) {
-        if (to == address(0)) revert ZeroAddress("Recipient");
+        _validateAddress(to, "to");
         
         // Fetch the ownership token ID from the agentNFT contract
         uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
@@ -651,36 +614,32 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         
         // Get the account associated with the ownership token
         address payable account = payable(agentNFT.getTokenBoundAccount(ownershipTokenId));
-        _validateTokenBoundAccount(account);
+        if (account == address(0)) revert InvalidTokenBoundAccount(account);
         
         // Execute the call to the specified address
         bytes memory result;
-        try IERC6551Account(account).executeCall(to, value, data) returns (bytes memory returnData) {
-            result = returnData;
-            if (result.length == 0) revert CallExecutionFailed();
+        try IERC6551Account(account).executeCall(to, value, data) returns (bytes memory ret) {
+            result = ret;
+            if (result.length == 0) revert ResultValidationFailed("executeCall", result);
         } catch Error(string memory reason) {
-            revert TokenOperationFailed(reason);
-        } catch {
             revert CallExecutionFailed();
+        } catch (bytes memory reason) {
+            revert ResultValidationFailed("executeCall", reason);
         }
+        
+        emit OperationAttempted("executeFromAgent", msg.sender, true);
         
         return result;
     }
     
-    /**
-     * @dev Transfer NEOX tokens from an agent's account
-     * @param agentId Agent ID
-     * @param recipient Recipient address
-     * @param amount Amount to transfer
-     * @return bytes Return data from the call
-     */
+    // Transfer NEOX tokens from Agent Ownership NFT wallet to another wallet or contract address
     function executeNEOXTransfer(
         uint256 agentId, 
         address recipient, 
         uint256 amount
     ) external whenNotPaused returns (bytes memory) {
-        if (recipient == address(0)) revert ZeroAddress("Recipient");
-        if (amount == 0) revert InsufficientFunds(1, 0);
+        _validateAddress(recipient, "recipient");
+        _validateRange(amount, "amount", 1, 0);
         
         // Get the NEOX token address
         address neoxTokenAddress = address(neoxToken);
@@ -696,62 +655,11 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         bytes memory result = executeFromAgent(agentId, neoxTokenAddress, 0, data);
         
         // Verify transfer success
-        bool success;
-        // Use a safer approach to decode the result
-        if (result.length > 0) {
-            // Standard ERC20 transfer returns bool
-            (success) = abi.decode(result, (bool));
-        } else {
-            success = false;
-        }
+        bool success = abi.decode(result, (bool));
+        if (!success) revert TokenOperationFailed("transfer");
         
-        if (!success) revert TokenOperationFailed("Token transfer failed");
-        
-        emit NEOXTransferred(agentId, recipient, amount);
-        
-        return result;
-    }
-    
-    /**
-     * @dev Transfer NFT from an agent's account
-     * @param agentId Agent ID
-     * @param nftContract NFT contract address
-     * @param recipient Recipient address
-     * @param tokenId Token ID to transfer
-     * @return bytes Return data from the call
-     */
-    function executeNFTTransfer(
-        uint256 agentId, 
-        address nftContract, 
-        address recipient, 
-        uint256 tokenId
-    ) external whenNotPaused returns (bytes memory) {
-        if (nftContract == address(0)) revert ZeroAddress("NFT contract");
-        if (recipient == address(0)) revert ZeroAddress("Recipient");
-        
-        // Get the agent's token bound account address
-        address agentAccount;
-        {
-            uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
-            if (ownershipTokenId == 0) revert NoOwnershipToken(agentId);
-            
-            agentAccount = agentNFT.getTokenBoundAccount(ownershipTokenId);
-            _validateTokenBoundAccount(agentAccount);
-        }
-        
-        // Encode the transferFrom function call: transferFrom(address from, address to, uint256 tokenId)
-        bytes memory data = abi.encodeWithSignature(
-            "transferFrom(address,address,uint256)",
-            agentAccount, // from: the agent's account
-            recipient,    // to: the recipient
-            tokenId       // tokenId: the NFT ID
-        );
-        
-        // Execute the call via the agent's token bound account
-        bytes memory result = executeFromAgent(agentId, nftContract, 0, data);
-        if (result.length == 0) revert TokenOperationFailed("NFT transfer failed");
-        
-        emit NFTTransferred(agentId, nftContract, recipient, tokenId);
+        emit NEOXTransferred(agentId, recipient, amount, success);
+        emit OperationAttempted("executeNEOXTransfer", msg.sender, true);
         
         return result;
     }
@@ -760,17 +668,13 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     // Purchase and Usage
     // ========================
     
-    /**
-     * @dev Purchase tier access to an agent
-     * @param agentId Agent ID
-     * @param tier Tier level to purchase (1-3)
-     */
+    // Purchase Tier Access to an Agent (Tiers 1 - 3)
     function purchaseTier(uint256 agentId, uint8 tier) external nonReentrant whenNotPaused {
         if (!agents[agentId].active) revert AgentNotActive(agentId);
-        if (tier < tierBasic || tier > tierPremium) revert InvalidTier(tier, tierBasic, tierPremium);
         
-        // Check rate limit
-        _checkTierPurchaseRateLimit(msg.sender, agentId);
+        if (tier < tierBasic || tier > tierPremium) {
+            revert InvalidTier(tier, uint8(tierBasic), uint8(tierPremium));
+        }
         
         uint256 tierCost;
         if (tier == tierBasic) {
@@ -781,9 +685,8 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
             tierCost = premiumTierCost;
         }
         
-        // Collect tier fee
-        bool feeTransferred = neoxToken.transferFrom(msg.sender, address(this), tierCost);
-        if (!feeTransferred) revert TransferFailed("Tier fee transfer failed");
+        // Collect tier fee using SafeERC20
+        neoxToken.safeTransferFrom(msg.sender, address(this), tierCost);
         
         // Calculate fee distribution
         uint256 creatorAmount = (tierCost * creatorPercentage) / 100;
@@ -793,26 +696,18 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         pendingWithdrawals[owner()] += platformAmount;
         
         // Distribute to NFT holders
-        try agentNFT.distributeRevenue(agentId, creatorAmount) returns (bool success) {
-            if (!success) {
-                // If distribution returns false, add to pending withdrawals for manual claiming
-                pendingWithdrawals[agents[agentId].creator] += creatorAmount;
-                emit RevenueDistributionFailed(agentId, creatorAmount, "Distribution returned false");
-            }
-        } catch Error(string memory reason) {
-            // If distribution reverts with reason, add to pending withdrawals
+        bool distributionSuccess = agentNFT.distributeRevenue(agentId, creatorAmount);
+        if (!distributionSuccess) {
+            // If distribution fails, add to pending withdrawals for manual claiming
             pendingWithdrawals[agents[agentId].creator] += creatorAmount;
-            emit RevenueDistributionFailed(agentId, creatorAmount, reason);
-        } catch {
-            // If distribution reverts without reason, add to pending withdrawals
-            pendingWithdrawals[agents[agentId].creator] += creatorAmount;
-            emit RevenueDistributionFailed(agentId, creatorAmount, "Distribution reverted");
+            emit RevenueDistributionFailed(agentId, creatorAmount, agents[agentId].creator);
         }
         
         // Grant tier access
         userTiers[msg.sender][agentId] = tier;
         
-        emit TierPurchased(agentId, msg.sender, tier);
+        emit TierPurchased(agentId, msg.sender, tier, tierCost);
+        emit OperationAttempted("purchaseTier", msg.sender, true);
     }
     
     /**
@@ -827,25 +722,26 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         if (tier == 0) revert NoTierAccess(msg.sender, agentId);
         
         // Check rate limit
-        _checkUsageRateLimit(msg.sender, agentId);
+        UsageData storage userData = usageHistory[msg.sender][agentId];
+        uint256 lastUsed = userData.lastUsageTime;
+        if (lastUsed > 0 && block.timestamp < lastUsed + usageCooldown) {
+            emit AgentRateLimitExceeded(msg.sender, agentId, lastUsed, usageCooldown);
+            revert RateLimitNotElapsed(msg.sender, agentId, lastUsed, usageCooldown);
+        }
         
-        // Collect usage fee
-        bool feeTransferred = neoxToken.transferFrom(msg.sender, address(this), usageFee);
-        if (!feeTransferred) revert TransferFailed("Usage fee transfer failed");
+        // Update usage data
+        userData.lastUsageTime = block.timestamp;
+        userData.totalUsage += 1;
+        
+        // Collect usage fee using SafeERC20
+        neoxToken.safeTransferFrom(msg.sender, address(this), usageFee);
         
         // Track usage
         agents[agentId].usageCount++;
         
         // Record usage in NFT contract
-        bool recordSuccess;
-        try agentNFT.recordUsage(agentId, msg.sender) returns (bool success) {
-            recordSuccess = success;
-            if (!recordSuccess) revert TokenOperationFailed("Usage recording returned false");
-        } catch Error(string memory reason) {
-            revert TokenOperationFailed(reason);
-        } catch {
-            revert TokenOperationFailed("Usage recording failed");
-        }
+        bool recordSuccess = agentNFT.recordUsage(agentId, msg.sender);
+        if (!recordSuccess) revert TokenOperationFailed("recordUsage");
         
         // Calculate fee distribution
         uint256 creatorAmount = (usageFee * creatorPercentage) / 100;
@@ -855,23 +751,15 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         pendingWithdrawals[owner()] += platformAmount;
         
         // Distribute to NFT holders
-        try agentNFT.distributeRevenue(agentId, creatorAmount) returns (bool success) {
-            if (!success) {
-                // If distribution returns false, add to pending withdrawals for manual claiming
-                pendingWithdrawals[agents[agentId].creator] += creatorAmount;
-                emit RevenueDistributionFailed(agentId, creatorAmount, "Distribution returned false");
-            }
-        } catch Error(string memory reason) {
-            // If distribution reverts with reason, add to pending withdrawals
+        bool distributionSuccess = agentNFT.distributeRevenue(agentId, creatorAmount);
+        if (!distributionSuccess) {
+            // If distribution fails, add to pending withdrawals for manual claiming
             pendingWithdrawals[agents[agentId].creator] += creatorAmount;
-            emit RevenueDistributionFailed(agentId, creatorAmount, reason);
-        } catch {
-            // If distribution reverts without reason, add to pending withdrawals
-            pendingWithdrawals[agents[agentId].creator] += creatorAmount;
-            emit RevenueDistributionFailed(agentId, creatorAmount, "Distribution reverted");
+            emit RevenueDistributionFailed(agentId, creatorAmount, agents[agentId].creator);
         }
         
-        emit AgentUsed(agentId, msg.sender, tier);
+        emit AgentUsed(agentId, msg.sender, tier, block.timestamp);
+        emit OperationAttempted("useAgent", msg.sender, true);
     }
     
     // ========================
@@ -888,11 +776,13 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         // Reset pending withdrawal before transfer to prevent reentrancy
         pendingWithdrawals[msg.sender] = 0;
         
-        // Transfer tokens to the user
-        bool success = neoxToken.transfer(msg.sender, amount);
-        if (!success) revert TransferFailed("Withdrawal transfer failed");
+        // Transfer tokens to the user using SafeERC20
+        emit WithdrawalRequested(msg.sender, amount);
+        
+        neoxToken.safeTransfer(msg.sender, amount);
         
         emit WithdrawalCompleted(msg.sender, amount);
+        emit OperationAttempted("requestWithdrawal", msg.sender, true);
     }
     
     /**
@@ -908,40 +798,32 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
     // View Functions
     // ========================
     
-    /**
-     * @dev Get ownership token ID for an agent
-     * @param agentId Agent ID
-     * @return Ownership token ID
-     */
+    // Get Ownership Token NFT ID
     function getAgentOwnershipToken(uint256 agentId) external view returns (uint256) {
         return agentNFT.getAgentOwnershipToken(agentId);
     }
     
-    /**
-     * @dev Get agent details
-     * @param agentId Agent ID
-     * @return Agent struct
-     */
+    // Get Agent NFT Details
     function getAgent(uint256 agentId) external view returns (Agent memory) {
         return agents[agentId];
     }
     
-    /**
-     * @dev Check if an address is a global operator
-     * @param operator Address to check
-     * @return bool True if global operator
-     */
+    // Check if Address is a Global Operator
     function isGlobalOperator(address operator) external view returns (bool) {
         return _globalOperators[operator];
     }
     
-    /**
-     * @dev Get creator agents with pagination
-     * @param creator Creator address
-     * @param offset Pagination offset
-     * @param limit Pagination limit
-     * @return Array of agent IDs
-     */
+    // Get rate limiting data for a user and agent
+    function getUserAgentUsageData(address user, uint256 agentId) external view returns (uint256 lastUsed, uint256 totalUsage, bool canUseNow) {
+        UsageData memory data = usageHistory[user][agentId];
+        return (
+            data.lastUsageTime,
+            data.totalUsage,
+            data.lastUsageTime == 0 || block.timestamp >= data.lastUsageTime + usageCooldown
+        );
+    }
+    
+    // Get creator agents with pagination
     function getCreatorAgents(address creator, uint256 offset, uint256 limit) external view returns (uint256[] memory) {
         uint256[] storage allAgents = creatorAgents[creator];
         
@@ -965,31 +847,51 @@ contract TBAgentRegistry is Ownable, ReentrancyGuard, Pausable {
         return result;
     }
     
-    /**
-     * @dev Get rate limit information for a user
-     * @param user User address
-     * @param agentId Agent ID
-     * @return creationTime Last creation time
-     * @return usageTime Last usage time
-     * @return purchaseTime Last tier purchase time
-     * @return creationCount24h Agent creation count in last 24h
-     * @return resetTime Time of last 24h counter reset
-     */
-    function getUserRateLimits(address user, uint256 agentId) external view returns (
-        uint64 creationTime,
-        uint64 usageTime,
-        uint64 purchaseTime,
-        uint256 creationCount24h,
-        uint64 resetTime
-    ) {
-        UserRateLimits storage limits = _userRateLimits[user];
+    // Update agent configuration items
+    function updateAgentConfiguration(
+        uint256 agentId, 
+        string memory customURI,
+        string memory personality,
+        string memory modelConfig
+    ) external nonReentrant whenNotPaused {
+        // Validate inputs
+        _validateString(customURI, "customURI", 1, 256);
+        _validateString(personality, "personality", 1, 1000);
+        _validateString(modelConfig, "modelConfig", 1, 1000);
         
-        return (
-            limits.lastCreationTime,
-            limits.lastAgentUsageTime[agentId],
-            limits.lastTierPurchaseTime[agentId],
-            limits.agentCreationCount24h,
-            limits.last24hReset
-        );
+        // Check ownership
+        uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
+        if (ownershipTokenId == 0) revert NoOwnershipToken(agentId);
+        
+        address currentOwner = agentNFT.ownerOf(ownershipTokenId);
+        if (currentOwner != msg.sender) revert NotAgentOwner(agentId, msg.sender, currentOwner);
+        
+        // Update agent configuration
+        Agent storage agent = agents[agentId];
+        
+        agent.customURI = customURI;
+        agent.personality = personality;
+        agent.modelConfig = modelConfig;
+        
+        emit AgentConfigurationUpdated(agentId, "customURI", customURI);
+        emit AgentConfigurationUpdated(agentId, "personality", personality);
+        emit AgentConfigurationUpdated(agentId, "modelConfig", modelConfig);
+        emit OperationAttempted("updateAgentConfiguration", msg.sender, true);
+    }
+    
+    // Activate or deactivate an agent
+    function setAgentStatus(uint256 agentId, bool active) external nonReentrant whenNotPaused {
+        // Check ownership
+        uint256 ownershipTokenId = agentNFT.getAgentOwnershipToken(agentId);
+        if (ownershipTokenId == 0) revert NoOwnershipToken(agentId);
+        
+        address currentOwner = agentNFT.ownerOf(ownershipTokenId);
+        if (currentOwner != msg.sender && msg.sender != owner()) revert NotAuthorized(msg.sender, ownershipTokenId);
+        
+        // Update status
+        agents[agentId].active = active;
+        
+        emit AgentStatusChanged(agentId, active);
+        emit OperationAttempted("setAgentStatus", msg.sender, true);
     }
 }
